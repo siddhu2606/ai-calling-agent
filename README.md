@@ -37,12 +37,19 @@ python -m venv .venv
 pip install -r requirements.txt
 
 copy .env.example .env
-# edit .env and add ANTHROPIC_API_KEY (or OPENAI_API_KEY)
+# edit .env and add GROQ_API_KEY (or ANTHROPIC_API_KEY / OPENAI_API_KEY,
+# matching whichever provider is set in config/agent_config.yaml -> llm.provider)
 
 python scripts\local_demo.py
 ```
 
 Speak into your mic after "Listening...". The agent transcribes, thinks, replies out loud, and loops — a full spoken conversation, entirely on your laptop.
+
+**No mic yet, or just testing your API key / call script?**
+```bash
+python scripts\text_chat_demo.py
+```
+Same brain, plain text in/out, no audio devices touched.
 
 ## Real phone calls (Twilio mode)
 

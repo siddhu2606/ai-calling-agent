@@ -104,7 +104,14 @@ class ConversationBrain:
 
     def _call_llm(self) -> str:
         if self.cfg.llm.provider == "openai":
-            return self._call_openai()
+            return self._call_openai_compatible(api_key=get_env("OPENAI_API_KEY"))
+        if self.cfg.llm.provider == "groq":
+            # Groq serves an OpenAI-compatible API, just at a different base URL —
+            # same client, same request shape, and it's very low-latency, which
+            # matters a lot for a live voice call.
+            return self._call_openai_compatible(
+                api_key=get_env("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1"
+            )
         return self._call_anthropic()
 
     def _call_anthropic(self) -> str:
@@ -121,10 +128,11 @@ class ConversationBrain:
         )
         return "".join(block.text for block in resp.content if block.type == "text").strip()
 
-    def _call_openai(self) -> str:
+    def _call_openai_compatible(self, api_key: str, base_url: str | None = None) -> str:
+        """Shared path for OpenAI and Groq — both speak the same chat.completions API."""
         from openai import OpenAI
 
-        client = OpenAI(api_key=get_env("OPENAI_API_KEY"))
+        client = OpenAI(api_key=api_key, base_url=base_url)
         messages = [{"role": "system", "content": self.system_prompt}]
         messages += [{"role": t.role, "content": t.content} for t in self.history]
         resp = client.chat.completions.create(

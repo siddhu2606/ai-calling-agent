@@ -10,11 +10,15 @@ agent:
   active_script: "sales_outbound"
 
 llm:
-  # "anthropic" or "openai"
-  provider: "anthropic"
-  model: "claude-sonnet-5"
+  # "anthropic", "openai", or "groq" (groq is free-tier friendly and very low-latency,
+  # which matters for a live voice call — good hackathon default)
+  provider: "groq"
+  model: "llama-3.3-70b-versatile"
   temperature: 0.7
   max_reply_tokens: 200
+  # Other options:
+  #   provider: anthropic, model: claude-sonnet-5
+  #   provider: openai,    model: gpt-4o-mini
 
 voice:
   # "edge" (free, no API key) or "elevenlabs" (cloned/premium voice, needs ELEVENLABS_API_KEY)
