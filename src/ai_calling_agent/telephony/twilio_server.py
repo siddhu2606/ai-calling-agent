@@ -45,6 +45,28 @@ AGENT_CFG = load_agent_config()
 # slow part (a few seconds), and every call would otherwise pay for it.
 STT = SpeechToText(AGENT_CFG.stt)
 
+# The full STT -> LLM -> TTS round trip realistically takes 3-8+ seconds
+# (confirmed against live calls). Dead silence for that long reads as a
+# dropped call and callers hang up before the real reply ever arrives -- this
+# was the actual root cause behind several "it's not responding" reports, not
+# a crash or a bad API key. Pre-synthesize a short filler line once at startup
+# and play it immediately when a turn starts processing, while the real
+# pipeline runs concurrently in the background -- masks the latency instead
+# of eliminating it (true fix would be streaming STT/TTS, out of scope here).
+FILLER_TEXT = "Mm-hmm, one moment."
+_FILLER_TTS = TextToSpeech(AGENT_CFG.voice)
+_filler_frames: list[bytes] = []
+
+
+@app.on_event("startup")
+async def _prewarm_filler_audio() -> None:
+    global _filler_frames
+    try:
+        _filler_frames = await synthesize_to_mulaw_frames(_FILLER_TTS, FILLER_TEXT)
+        print(f"[startup] pre-synthesized filler audio ({len(_filler_frames)} frames)")
+    except Exception as e:
+        print(f"[startup] failed to pre-synthesize filler audio, continuing without it: {e!r}")
+
 TWILIO_SAMPLE_RATE = 8000
 WHISPER_SAMPLE_RATE = 16000
 FRAME_MS = 20  # Twilio sends/expects 20ms mu-law frames (160 bytes @ 8kHz)
@@ -184,14 +206,9 @@ async def send_audio_to_twilio(ws: WebSocket, stream_sid: str, frames: list[byte
             await asyncio.sleep(remaining)
 
 
-async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
-    """Run STT -> brain -> TTS on the buffered utterance. Returns False to end the call."""
-    pcm8k = b"".join(state.frame_buffer)
-    state.frame_buffer.clear()
-    state.consecutive_silence = 0
-    state.speech_frame_count = 0
-    state.started_speaking = False
-
+async def _think(pcm8k: bytes, state: CallState) -> tuple[str, bool]:
+    """Run STT -> brain and decide what to say. Returns (reply_text, should_end);
+    reply_text == '' means say nothing (e.g. nothing recognizable was said)."""
     whisper_input = pcm8k_to_whisper_input(pcm8k)
     # STT and the LLM call are both blocking/CPU-or-network-bound — run them in
     # worker threads so they don't stall uvicorn's event loop (which is also
@@ -200,26 +217,50 @@ async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
         user_text = await asyncio.to_thread(STT.transcribe_pcm, whisper_input)
     except Exception as e:
         print(f"[handle_utterance] STT failed: {e!r}")
-        await speak_safe(ws, state, "Sorry, I didn't catch that, could you say it again?")
-        return True
+        return "Sorry, I didn't catch that, could you say it again?", False
 
     if not user_text:
-        return True
+        return "", False
     print(f"Caller: {user_text}")
 
     if state.brain.should_end_call(user_text):
-        await speak_safe(ws, state, "Alright, thanks for calling, take care!")
-        return False
+        return "Alright, thanks for calling, take care!", True
 
     try:
         reply = await asyncio.to_thread(state.brain.respond, user_text)
     except Exception as e:
         print(f"[handle_utterance] LLM call failed: {e!r}")
         reply = "Sorry, I'm having a little trouble on my end, could you say that again?"
-    print(f"Agent: {reply}")
 
-    await speak_safe(ws, state, reply)
-    return True
+    if not reply:
+        # Confirmed against this Groq model: a reasoning model can burn its
+        # whole token budget on hidden reasoning and return empty content.
+        print("[handle_utterance] LLM returned empty content, using fallback line")
+        reply = "Sorry, could you say that again?"
+    return reply, False
+
+
+async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
+    """Process the buffered utterance. Returns False to end the call."""
+    pcm8k = b"".join(state.frame_buffer)
+    state.frame_buffer.clear()
+    state.consecutive_silence = 0
+    state.speech_frame_count = 0
+    state.started_speaking = False
+
+    # Kick off STT+LLM in the background and immediately play a short filler
+    # so the caller hears something right away instead of several seconds of
+    # dead air -- confirmed live to be the actual cause of "it's not
+    # responding" reports (callers hanging up before the real reply arrived).
+    think_task = asyncio.create_task(_think(pcm8k, state))
+    if _filler_frames:
+        await send_audio_to_twilio(ws, state.stream_sid, _filler_frames)
+
+    reply, should_end = await think_task
+    if reply:
+        print(f"Agent: {reply}")
+        await speak_safe(ws, state, reply)
+    return not should_end
 
 
 def _log_end_of_call_diagnostics(state: CallState) -> None:
