@@ -22,6 +22,8 @@ import asyncio
 import audioop
 import base64
 import json
+import os
+import traceback
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -115,6 +117,13 @@ def pcm8k_to_whisper_input(pcm16_8k: bytes) -> np.ndarray:
 async def synthesize_to_mulaw_frames(tts: TextToSpeech, text: str) -> list[bytes]:
     """Text -> list of 160-byte mu-law frames at 8kHz, ready to stream to Twilio."""
     audio_path = await tts.asynthesize_to_file(text)
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        # Seen once against a live Twilio call: edge-tts returned without error
+        # but produced no audio (a transient hiccup talking to its backend).
+        # Fail loudly and specifically here rather than letting soundfile raise
+        # a cryptic "File does not exist (possibly a pipe?)" a layer down.
+        raise RuntimeError(f"TTS produced no audio file for text: {text!r}")
+
     data, samplerate = sf.read(audio_path, dtype="float32", always_2d=False)
     if data.ndim > 1:
         data = data.mean(axis=1)  # downmix to mono
@@ -125,6 +134,23 @@ async def synthesize_to_mulaw_frames(tts: TextToSpeech, text: str) -> list[bytes
 
     frames = [mulaw[i : i + FRAME_BYTES] for i in range(0, len(mulaw), FRAME_BYTES)]
     return frames
+
+
+async def speak_safe(ws: WebSocket, state: CallState, text: str, retries: int = 1) -> bool:
+    """Synthesize + send `text`, retrying once on failure instead of killing the
+    call. Returns False (call continues) if every attempt failed -- the caller
+    just stays silent for that turn rather than the whole handler crashing."""
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            frames = await synthesize_to_mulaw_frames(state.tts, text)
+            await send_audio_to_twilio(ws, state.stream_sid, frames)
+            return True
+        except Exception as e:  # noqa: BLE001 - deliberately broad: never crash a live call
+            last_error = e
+            print(f"[speak_safe] attempt {attempt + 1} failed: {e!r}")
+    print(f"[speak_safe] giving up after {retries + 1} attempts: {last_error!r}")
+    return False
 
 
 async def send_audio_to_twilio(ws: WebSocket, stream_sid: str, frames: list[bytes]) -> None:
@@ -149,20 +175,29 @@ async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
     # STT and the LLM call are both blocking/CPU-or-network-bound — run them in
     # worker threads so they don't stall uvicorn's event loop (which is also
     # responsible for reading the next incoming audio frames on this call).
-    user_text = await asyncio.to_thread(STT.transcribe_pcm, whisper_input)
+    try:
+        user_text = await asyncio.to_thread(STT.transcribe_pcm, whisper_input)
+    except Exception as e:
+        print(f"[handle_utterance] STT failed: {e!r}")
+        await speak_safe(ws, state, "Sorry, I didn't catch that, could you say it again?")
+        return True
+
     if not user_text:
         return True
     print(f"Caller: {user_text}")
 
     if state.brain.should_end_call(user_text):
-        frames = await synthesize_to_mulaw_frames(state.tts, "Alright, thanks for calling, take care!")
-        await send_audio_to_twilio(ws, state.stream_sid, frames)
+        await speak_safe(ws, state, "Alright, thanks for calling, take care!")
         return False
 
-    reply = await asyncio.to_thread(state.brain.respond, user_text)
+    try:
+        reply = await asyncio.to_thread(state.brain.respond, user_text)
+    except Exception as e:
+        print(f"[handle_utterance] LLM call failed: {e!r}")
+        reply = "Sorry, I'm having a little trouble on my end, could you say that again?"
     print(f"Agent: {reply}")
-    frames = await synthesize_to_mulaw_frames(state.tts, reply)
-    await send_audio_to_twilio(ws, state.stream_sid, frames)
+
+    await speak_safe(ws, state, reply)
     return True
 
 
@@ -181,8 +216,7 @@ async def media_stream(ws: WebSocket) -> None:
                 state.stream_sid = msg["start"]["streamSid"]
                 opening = state.brain.opening_line()
                 print(f"Agent: {opening}")
-                frames = await synthesize_to_mulaw_frames(state.tts, opening)
-                await send_audio_to_twilio(ws, state.stream_sid, frames)
+                await speak_safe(ws, state, opening)
 
             elif event == "media":
                 mulaw_frame = base64.b64decode(msg["media"]["payload"])
@@ -213,3 +247,8 @@ async def media_stream(ws: WebSocket) -> None:
 
     except WebSocketDisconnect:
         pass
+    except Exception:
+        # Last-resort net: log clearly and end this call gracefully instead of
+        # an opaque ASGI traceback and a dead-silent line for the caller.
+        print("[media_stream] unexpected error, ending call:")
+        traceback.print_exc()
