@@ -77,6 +77,12 @@ SILENCE_FRAMES_NEEDED = int(1.2 * 1000 / FRAME_MS)  # ~1.2s of silence ends a tu
 RMS_SMOOTHING_FRAMES = 3  # ~60ms rolling average -- absorbs brief line noise/crackle
 # so a single noisy frame doesn't reset the silence counter and stall turn-end detection
 MIN_SPEECH_FRAMES = int(0.6 * 1000 / FRAME_MS)  # was 0.4s -- too eager, tripped on breath/line noise
+# Confirmed live: a caller speaking in short, hesitant bursts (each under 0.6s,
+# separated by pauses over 1.2s) had EVERY burst discarded individually before
+# the next one began, since discarding wiped the buffer/count immediately.
+# Only give up entirely after a much longer silence with still-insufficient
+# speech -- short pauses mid-thought should not erase progress already made.
+GIVE_UP_SILENCE_FRAMES = int(4.0 * 1000 / FRAME_MS)  # ~4s of silence before discarding as noise
 
 
 @app.post("/voice")
@@ -336,21 +342,32 @@ async def media_stream(ws: WebSocket) -> None:
                 elif state.started_speaking:
                     state.consecutive_silence += 1
                     state.frame_buffer.append(mulaw_frame)
-                    if state.consecutive_silence >= SILENCE_FRAMES_NEEDED:
-                        if state.speech_frame_count >= MIN_SPEECH_FRAMES:
-                            keep_going = await handle_utterance(ws, state)
-                            if not keep_going:
-                                await ws.close()
-                                return
-                        else:
-                            print(
-                                f"[VAD] discarding utterance, too short "
-                                f"({state.speech_frame_count} voiced frames < {MIN_SPEECH_FRAMES} needed)"
-                            )
-                            state.frame_buffer.clear()
-                            state.started_speaking = False
-                            state.consecutive_silence = 0
-                            state.speech_frame_count = 0
+                    if (
+                        state.consecutive_silence >= SILENCE_FRAMES_NEEDED
+                        and state.speech_frame_count >= MIN_SPEECH_FRAMES
+                    ):
+                        # Enough real speech, and a clean pause -- treat it as
+                        # a finished turn.
+                        keep_going = await handle_utterance(ws, state)
+                        if not keep_going:
+                            await ws.close()
+                            return
+                    elif state.consecutive_silence >= GIVE_UP_SILENCE_FRAMES:
+                        # Not enough speech even after a long pause -- genuinely
+                        # give up, this was likely just noise.
+                        print(
+                            f"[VAD] discarding utterance, too short after {GIVE_UP_SILENCE_FRAMES * FRAME_MS / 1000:.1f}s "
+                            f"of silence ({state.speech_frame_count} voiced frames < {MIN_SPEECH_FRAMES} needed)"
+                        )
+                        state.frame_buffer.clear()
+                        state.started_speaking = False
+                        state.consecutive_silence = 0
+                        state.speech_frame_count = 0
+                    # else: a short pause with not-quite-enough speech yet --
+                    # keep listening rather than discarding progress, so a
+                    # hesitant/paused sentence can still accumulate into one
+                    # full utterance instead of being thrown away fragment by
+                    # fragment (confirmed live: this was happening repeatedly).
 
             elif event == "stop":
                 _log_end_of_call_diagnostics(state)
