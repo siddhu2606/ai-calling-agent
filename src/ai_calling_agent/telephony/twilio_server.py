@@ -54,7 +54,7 @@ SILENCE_RMS_THRESHOLD = float(get_env("VAD_RMS_THRESHOLD", "400"))
 SILENCE_FRAMES_NEEDED = int(1.2 * 1000 / FRAME_MS)  # ~1.2s of silence ends a turn
 RMS_SMOOTHING_FRAMES = 3  # ~60ms rolling average -- absorbs brief line noise/crackle
 # so a single noisy frame doesn't reset the silence counter and stall turn-end detection
-MIN_SPEECH_FRAMES = int(0.4 * 1000 / FRAME_MS)
+MIN_SPEECH_FRAMES = int(0.6 * 1000 / FRAME_MS)  # was 0.4s -- too eager, tripped on breath/line noise
 
 
 @app.post("/voice")
@@ -160,13 +160,28 @@ async def speak_safe(ws: WebSocket, state: CallState, text: str, retries: int = 
 
 
 async def send_audio_to_twilio(ws: WebSocket, stream_sid: str, frames: list[bytes]) -> None:
-    """Stream mu-law frames back to Twilio, paced at real-time (20ms/frame)."""
-    for frame in frames:
+    """Stream mu-law frames back to Twilio, paced at real-time (20ms/frame).
+
+    Confirmed live: sleeping a fixed 20ms *after* each frame lets the per-frame
+    base64/JSON/send overhead accumulate as drift, so actual delivery slowly
+    falls behind real-time -- Twilio's playout buffer then periodically runs
+    dry, which is heard as choppy/cutting audio. Pace against an absolute
+    clock instead: compute each frame's exact scheduled time up front and only
+    sleep however long is left to reach it (0 if we're already behind), so
+    per-frame overhead never compounds across the whole utterance.
+    """
+    frame_interval = FRAME_MS / 1000
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    for i, frame in enumerate(frames):
         payload = base64.b64encode(frame).decode("ascii")
         await ws.send_text(
             json.dumps({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}})
         )
-        await asyncio.sleep(FRAME_MS / 1000)
+        target_time = start + (i + 1) * frame_interval
+        remaining = target_time - loop.time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
 
 async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
