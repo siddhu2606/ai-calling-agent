@@ -1,0 +1,42 @@
+# Persona, LLM, and voice settings for the agent.
+# Edit this per-hackathon: change the persona/company, pick your active script,
+# and swap the voice provider once you've cloned a real voice in ElevenLabs.
+
+agent:
+  name: "Alex"
+  role: "AI Sales Development Rep"
+  company: "Your Company"
+  # Which entry in call_scripts.yaml to use for this run
+  active_script: "sales_outbound"
+
+llm:
+  # "anthropic" or "openai"
+  provider: "anthropic"
+  model: "claude-sonnet-5"
+  temperature: 0.7
+  max_reply_tokens: 200
+
+voice:
+  # "edge" (free, no API key) or "elevenlabs" (cloned/premium voice, needs ELEVENLABS_API_KEY)
+  provider: "edge"
+  edge_voice: "en-US-GuyNeural"     # try en-US-AriaNeural, en-GB-RyanNeural, etc.
+  elevenlabs_voice_id: ""           # fill in after cloning a voice in ElevenLabs
+  elevenlabs_model: "eleven_turbo_v2_5"
+
+stt:
+  # faster-whisper model size: tiny/base/small/medium/large-v3
+  # "small" is a good speed/accuracy tradeoff for live conversation
+  model_size: "small"
+  device: "cpu"
+  compute_type: "int8"
+  language: "en"
+
+behavior:
+  max_turns: 30
+  silence_timeout_seconds: 1.2
+  barge_in: true          # allow the caller to interrupt the agent mid-sentence (see conversation.py)
+  end_call_phrases:
+    - "bye"
+    - "goodbye"
+    - "hang up"
+    - "that's all"
