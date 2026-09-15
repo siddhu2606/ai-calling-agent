@@ -9,7 +9,8 @@ Usage:
 import sys
 from pathlib import Path
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # safe on legacy cmd.exe codepages
+sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)  # safe on legacy
+sys.stderr.reconfigure(line_buffering=True)  # cmd.exe codepages; unbuffered so live logs aren't lost
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import uvicorn  # noqa: E402

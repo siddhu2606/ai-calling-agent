@@ -3,7 +3,7 @@
 # and swap the voice provider once you've cloned a real voice in ElevenLabs.
 
 agent:
-  name: "Alex"
+  name: "Isha"
   role: "AI Sales Development Rep"
   company: "Your Company"
   # Which entry in call_scripts.yaml to use for this run
@@ -25,7 +25,7 @@ llm:
 voice:
   # "edge" (free, no API key) or "elevenlabs" (cloned/premium voice, needs ELEVENLABS_API_KEY)
   provider: "edge"
-  edge_voice: "en-US-GuyNeural"     # try en-US-AriaNeural, en-GB-RyanNeural, etc.
+  edge_voice: "en-IN-NeerjaNeural"  # female, Indian English. Try en-US-AriaNeural for a US accent instead.
   elevenlabs_voice_id: ""           # fill in after cloning a voice in ElevenLabs
   elevenlabs_model: "eleven_turbo_v2_5"
 
