@@ -49,8 +49,11 @@ TWILIO_SAMPLE_RATE = 8000
 WHISPER_SAMPLE_RATE = 16000
 FRAME_MS = 20  # Twilio sends/expects 20ms mu-law frames (160 bytes @ 8kHz)
 FRAME_BYTES = int(TWILIO_SAMPLE_RATE * FRAME_MS / 1000)  # 160
-SILENCE_RMS_THRESHOLD = 400  # on 16-bit PCM scale, tune against real calls
+# Override via VAD_RMS_THRESHOLD in .env without a code change/redeploy while calibrating.
+SILENCE_RMS_THRESHOLD = float(get_env("VAD_RMS_THRESHOLD", "400"))
 SILENCE_FRAMES_NEEDED = int(1.2 * 1000 / FRAME_MS)  # ~1.2s of silence ends a turn
+RMS_SMOOTHING_FRAMES = 3  # ~60ms rolling average -- absorbs brief line noise/crackle
+# so a single noisy frame doesn't reset the silence counter and stall turn-end detection
 MIN_SPEECH_FRAMES = int(0.4 * 1000 / FRAME_MS)
 
 
@@ -95,6 +98,9 @@ class CallState:
     consecutive_silence: int = 0
     speech_frame_count: int = 0
     started_speaking: bool = False
+    recent_rms: list[float] = field(default_factory=list)  # small rolling window, see frame_rms smoothing
+    total_frames_seen: int = 0
+    max_rms_seen: float = 0.0
 
 
 def mulaw_frame_to_pcm16(frame: bytes) -> bytes:
@@ -201,6 +207,35 @@ async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
     return True
 
 
+def _log_end_of_call_diagnostics(state: CallState) -> None:
+    """Best-effort diagnostics printed when a call ends, so a silent/unresponsive
+    call is debuggable from the log alone instead of guesswork."""
+    print(
+        f"[call end] frames_seen={state.total_frames_seen} "
+        f"max_rms_seen={state.max_rms_seen:.0f} (threshold={SILENCE_RMS_THRESHOLD:.0f}) "
+        f"speech_was_detected={state.started_speaking or state.speech_frame_count > 0} "
+        f"buffered_frames_at_end={len(state.frame_buffer)}"
+    )
+    if state.max_rms_seen > 0 and state.max_rms_seen < SILENCE_RMS_THRESHOLD:
+        print(
+            "[call end] HINT: max_rms_seen never crossed the threshold -- "
+            "SILENCE_RMS_THRESHOLD is likely too high for this call's audio level. "
+            "Lower it via VAD_RMS_THRESHOLD in .env."
+        )
+    if state.frame_buffer and state.speech_frame_count >= MIN_SPEECH_FRAMES:
+        # There's a real, never-finalized utterance sitting in the buffer --
+        # the call ended before enough trailing silence was seen. Can't speak
+        # a reply back (the stream is closing), but worth knowing what STT
+        # would have made of it.
+        try:
+            pcm8k = b"".join(state.frame_buffer)
+            whisper_input = pcm8k_to_whisper_input(pcm8k)
+            text = STT.transcribe_pcm(whisper_input)
+            print(f"[call end] HINT: never-finalized speech in buffer transcribed to: {text!r}")
+        except Exception as e:
+            print(f"[call end] (diagnostic transcription of leftover buffer failed: {e!r})")
+
+
 @app.websocket("/media")
 async def media_stream(ws: WebSocket) -> None:
     await ws.accept()
@@ -221,9 +256,23 @@ async def media_stream(ws: WebSocket) -> None:
             elif event == "media":
                 mulaw_frame = base64.b64decode(msg["media"]["payload"])
                 pcm16 = mulaw_frame_to_pcm16(mulaw_frame)
-                rms = frame_rms(pcm16)
+                raw_rms = frame_rms(pcm16)
+
+                # Smooth over a few frames so a single noisy/crackly frame on a
+                # real phone line can't reset the silence counter and stall
+                # turn-end detection indefinitely -- this is the leading
+                # suspect for a call where the agent never responds at all.
+                state.recent_rms.append(raw_rms)
+                if len(state.recent_rms) > RMS_SMOOTHING_FRAMES:
+                    state.recent_rms.pop(0)
+                rms = sum(state.recent_rms) / len(state.recent_rms)
+
+                state.total_frames_seen += 1
+                state.max_rms_seen = max(state.max_rms_seen, raw_rms)
 
                 if rms > SILENCE_RMS_THRESHOLD:
+                    if not state.started_speaking:
+                        print(f"[VAD] speech detected (smoothed rms={rms:.0f}, threshold={SILENCE_RMS_THRESHOLD:.0f})")
                     state.started_speaking = True
                     state.consecutive_silence = 0
                     state.speech_frame_count += 1
@@ -238,17 +287,24 @@ async def media_stream(ws: WebSocket) -> None:
                                 await ws.close()
                                 return
                         else:
+                            print(
+                                f"[VAD] discarding utterance, too short "
+                                f"({state.speech_frame_count} voiced frames < {MIN_SPEECH_FRAMES} needed)"
+                            )
                             state.frame_buffer.clear()
                             state.started_speaking = False
                             state.consecutive_silence = 0
+                            state.speech_frame_count = 0
 
             elif event == "stop":
+                _log_end_of_call_diagnostics(state)
                 break
 
     except WebSocketDisconnect:
-        pass
+        _log_end_of_call_diagnostics(state)
     except Exception:
         # Last-resort net: log clearly and end this call gracefully instead of
         # an opaque ASGI traceback and a dead-silent line for the caller.
+        _log_end_of_call_diagnostics(state)
         print("[media_stream] unexpected error, ending call:")
         traceback.print_exc()
