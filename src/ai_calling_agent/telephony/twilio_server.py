@@ -112,9 +112,9 @@ def pcm8k_to_whisper_input(pcm16_8k: bytes) -> np.ndarray:
     return audio
 
 
-def synthesize_to_mulaw_frames(tts: TextToSpeech, text: str) -> list[bytes]:
+async def synthesize_to_mulaw_frames(tts: TextToSpeech, text: str) -> list[bytes]:
     """Text -> list of 160-byte mu-law frames at 8kHz, ready to stream to Twilio."""
-    audio_path = tts.synthesize_to_file(text)
+    audio_path = await tts.asynthesize_to_file(text)
     data, samplerate = sf.read(audio_path, dtype="float32", always_2d=False)
     if data.ndim > 1:
         data = data.mean(axis=1)  # downmix to mono
@@ -146,19 +146,22 @@ async def handle_utterance(ws: WebSocket, state: CallState) -> bool:
     state.started_speaking = False
 
     whisper_input = pcm8k_to_whisper_input(pcm8k)
-    user_text = STT.transcribe_pcm(whisper_input)
+    # STT and the LLM call are both blocking/CPU-or-network-bound — run them in
+    # worker threads so they don't stall uvicorn's event loop (which is also
+    # responsible for reading the next incoming audio frames on this call).
+    user_text = await asyncio.to_thread(STT.transcribe_pcm, whisper_input)
     if not user_text:
         return True
     print(f"Caller: {user_text}")
 
     if state.brain.should_end_call(user_text):
-        frames = synthesize_to_mulaw_frames(state.tts, "Alright, thanks for calling — take care!")
+        frames = await synthesize_to_mulaw_frames(state.tts, "Alright, thanks for calling, take care!")
         await send_audio_to_twilio(ws, state.stream_sid, frames)
         return False
 
-    reply = state.brain.respond(user_text)
+    reply = await asyncio.to_thread(state.brain.respond, user_text)
     print(f"Agent: {reply}")
-    frames = synthesize_to_mulaw_frames(state.tts, reply)
+    frames = await synthesize_to_mulaw_frames(state.tts, reply)
     await send_audio_to_twilio(ws, state.stream_sid, frames)
     return True
 
@@ -178,7 +181,7 @@ async def media_stream(ws: WebSocket) -> None:
                 state.stream_sid = msg["start"]["streamSid"]
                 opening = state.brain.opening_line()
                 print(f"Agent: {opening}")
-                frames = synthesize_to_mulaw_frames(state.tts, opening)
+                frames = await synthesize_to_mulaw_frames(state.tts, opening)
                 await send_audio_to_twilio(ws, state.stream_sid, frames)
 
             elif event == "media":

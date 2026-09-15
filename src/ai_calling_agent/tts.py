@@ -5,13 +5,19 @@
 - ElevenLabsTTS: premium / voice-cloned. Point `elevenlabs_voice_id` at a
   cloned voice (upload a sample clip in the ElevenLabs dashboard) if you want
   to legitimately say "we trained a custom voice" in your pitch.
+
+Both a sync API (`synthesize_to_file`, for the local mic/speaker demo, which
+runs outside any event loop) and an async API (`asynthesize_to_file`, for the
+Twilio server, which runs inside uvicorn's event loop) are provided. Calling
+the sync `asyncio.run()`-based path from inside an already-running event loop
+raises "asyncio.run() cannot be called from a running event loop" — that's
+exactly the bug this split avoids.
 """
 
 from __future__ import annotations
 
 import asyncio
 import tempfile
-from pathlib import Path
 
 from .config import VoiceConfig, get_env
 
@@ -27,10 +33,19 @@ class TextToSpeech:
             self._backend = _EdgeTTSBackend(cfg)
 
     def synthesize_to_file(self, text: str, out_path: str | None = None) -> str:
-        """Synthesize `text` to a wav/mp3 file on disk and return its path."""
+        """Synchronous entrypoint — use from plain scripts (local demo), never
+        from inside an async event loop."""
         if out_path is None:
             out_path = tempfile.mktemp(suffix=self._backend.file_suffix)
         self._backend.synthesize_to_file(text, out_path)
+        return out_path
+
+    async def asynthesize_to_file(self, text: str, out_path: str | None = None) -> str:
+        """Async entrypoint — use from inside an async event loop (the Twilio
+        websocket handler)."""
+        if out_path is None:
+            out_path = tempfile.mktemp(suffix=self._backend.file_suffix)
+        await self._backend.asynthesize_to_file(text, out_path)
         return out_path
 
 
@@ -40,6 +55,9 @@ class _Backend:
     def synthesize_to_file(self, text: str, out_path: str) -> None:
         raise NotImplementedError
 
+    async def asynthesize_to_file(self, text: str, out_path: str) -> None:
+        raise NotImplementedError
+
 
 class _EdgeTTSBackend(_Backend):
     file_suffix = ".mp3"
@@ -47,14 +65,17 @@ class _EdgeTTSBackend(_Backend):
     def __init__(self, cfg: VoiceConfig):
         self.voice = cfg.edge_voice
 
-    def synthesize_to_file(self, text: str, out_path: str) -> None:
+    async def _save(self, text: str, out_path: str) -> None:
         import edge_tts
 
-        async def _run():
-            communicate = edge_tts.Communicate(text, self.voice)
-            await communicate.save(out_path)
+        communicate = edge_tts.Communicate(text, self.voice)
+        await communicate.save(out_path)
 
-        asyncio.run(_run())
+    def synthesize_to_file(self, text: str, out_path: str) -> None:
+        asyncio.run(self._save(text, out_path))
+
+    async def asynthesize_to_file(self, text: str, out_path: str) -> None:
+        await self._save(text, out_path)
 
 
 class _ElevenLabsBackend(_Backend):
@@ -88,6 +109,11 @@ class _ElevenLabsBackend(_Backend):
             for chunk in audio:
                 if chunk:
                     f.write(chunk)
+
+    async def asynthesize_to_file(self, text: str, out_path: str) -> None:
+        # The ElevenLabs SDK is a blocking/sync HTTP client — run it in a
+        # worker thread so it doesn't block uvicorn's event loop.
+        await asyncio.to_thread(self.synthesize_to_file, text, out_path)
 
 
 def play_file(path: str) -> None:

@@ -13,10 +13,12 @@ llm:
   # "anthropic", "openai", or "groq" (groq is free-tier friendly and very low-latency,
   # which matters for a live voice call — good hackathon default)
   provider: "groq"
-  model: "llama-3.3-70b-versatile"
+  model: "openai/gpt-oss-120b"
   temperature: 0.7
   max_reply_tokens: 200
-  # Other options:
+  # Other options (check `client.models.list()` against your own key — Groq's
+  # lineup changes over time):
+  #   provider: groq,      model: openai/gpt-oss-20b   (smaller/faster)
   #   provider: anthropic, model: claude-sonnet-5
   #   provider: openai,    model: gpt-4o-mini
 
